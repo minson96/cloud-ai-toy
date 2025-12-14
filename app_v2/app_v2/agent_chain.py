@@ -1,3 +1,4 @@
+# app_v2/agent_chain.py
 import json
 import re
 from typing import Any, Dict, List, Tuple
@@ -5,14 +6,16 @@ from typing import Any, Dict, List, Tuple
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from .classifier import get_classifier
 from .rag_chain import generate_answer, retrieve_contexts
-from .settings import ANTHROPIC_API_KEY, ANTHROPIC_MODEL, require_env
+from .settings import ANTHROPIC_API_KEY, ANTHROPIC_MODEL, CLASSIFIER_MODEL_PATH, require_env
 
 REWRITE_SYSTEM = """너는 검색 질의 재작성기다.
 규칙:
 - 원 질문의 의미를 유지하면서, 문서 검색에 유리한 핵심 키워드 형태로 바꾼다.
 - 사실을 추가하지 않는다.
 - 출력은 JSON 한 줄로만 한다: {"rewritten_query": "..."}"""
+
 
 def _rewrite_query_for_search(query: str) -> str:
     require_env("ANTHROPIC_API_KEY", ANTHROPIC_API_KEY)
@@ -46,14 +49,10 @@ def _decide_style(query: str, top_k: int) -> Dict[str, Any]:
 
 
 def _clean_answer(text: str) -> str:
-    """
-    LLM이 가끔 남기는 마크다운 찌꺼기(마지막 '**', '---' 등) 제거.
-    """
     if not text:
         return text
 
     t = text.strip()
-
     lines = t.splitlines()
     while lines and lines[-1].strip() in {"**", "*", "```", "---"}:
         lines.pop()
@@ -71,12 +70,6 @@ _CITE_RE = re.compile(r"\(doc_id=.*?,\s*chunk_id=.*?\)\s*$", re.UNICODE)
 
 
 def _validate_output(answer: str, summary_level: str, max_bullets: int) -> Tuple[bool, List[str]]:
-    """
-    summary_level == 'high'이면:
-    - heading(#...) / 빈줄 / bullet만 허용
-    - bullet은 반드시 (doc_id=..., chunk_id=...)로 끝나야 함
-    - bullet 개수는 max_bullets 이하여야 함
-    """
     bad: List[str] = []
     bullet_count = 0
 
@@ -106,16 +99,42 @@ def _validate_output(answer: str, summary_level: str, max_bullets: int) -> Tuple
 def agent_answer(query: str, top_k: int = 5) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
     style = _decide_style(query, top_k)
 
-    # 1차 검색
-    contexts = retrieve_contexts(query, top_k=top_k)
-    decision: Dict[str, Any] = {"search_rounds": 1, "rewritten": False, "style": style}
+    # (추가) 질의 분류 → 검색 필터
+    clf = get_classifier(CLASSIFIER_MODEL_PATH)
+    q_pred = clf.predict(query)
+
+    # confidence 낮으면 필터 적용 안 함(검색 누락 방지)
+    filters: Dict[str, Any] | None = None
+    if q_pred.confidence >= 0.5:
+        filters = {"category": q_pred.category}
+
+    decision: Dict[str, Any] = {
+        "search_rounds": 1,
+        "rewritten": False,
+        "style": style,
+        "query_category": {
+            "category": q_pred.category,
+            "confidence": q_pred.confidence,
+            "method": q_pred.method,
+        },
+        "applied_filter": filters,
+    }
+
+    # 1차 검색(필터 적용 가능)
+    contexts = retrieve_contexts(query, top_k=top_k, filters=filters)
 
     if not contexts:
-        # 2차: 질의 재작성 후 재검색
+        # 2차: 질의 재작성 후 재검색(필터는 그대로 유지)
         rewritten = _rewrite_query_for_search(query)
-        contexts = retrieve_contexts(rewritten, top_k=min(20, top_k + 5))
+        contexts = retrieve_contexts(rewritten, top_k=min(20, top_k + 5), filters=filters)
         decision["search_rounds"] = 2
         decision["rewritten"] = (rewritten != query)
+
+        # 그래도 없으면: 필터가 너무 빡셌을 수 있으니 “필터 해제” 재검색 1회
+        if not contexts and filters is not None:
+            decision["search_rounds"] = 3
+            decision["applied_filter"] = None
+            contexts = retrieve_contexts(rewritten, top_k=min(20, top_k + 5), filters=None)
 
         if not contexts:
             return "문서 근거가 부족하다", [], decision
@@ -133,12 +152,10 @@ def agent_answer(query: str, top_k: int = 5) -> Tuple[str, List[Dict[str, Any]],
         if ok:
             return answer, contexts, decision
 
-        # 재생성(요약이면 더 짧게 유지)
         stronger_style = dict(style)
         if stronger_style.get("summary_level") == "high":
             stronger_style["max_bullets"] = min(int(stronger_style.get("max_bullets", 8)), 8)
 
         answer = _clean_answer(generate_answer(query, contexts, style=stronger_style))
 
-    # 끝까지 실패하면 안전 종료
     return "문서 근거가 부족하다", contexts, decision

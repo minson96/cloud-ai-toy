@@ -1,3 +1,4 @@
+# app_v2/rag_chain.py
 from typing import Any, Dict, List, Optional
 
 from langchain_anthropic import ChatAnthropic
@@ -15,10 +16,16 @@ SYSTEM_PROMPT = """너는 식품 안전/위생/영양 문서에 기반해 한국
 - 컨텍스트에 근거가 없으면 '문서 근거가 부족하다'고 말한다.
 """
 
-def retrieve_contexts(query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-    """PGVector에서 유사 문서 조각을 top_k개 가져와 API 응답용 dict로 변환."""
+
+def retrieve_contexts(query: str, top_k: int = 5, filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     vs = get_vectorstore()
-    docs: List[Document] = vs.similarity_search(query, k=top_k)
+
+    # langchain_postgres PGVector는 similarity_search에 filter(메타데이터) 전달 가능
+    kwargs: Dict[str, Any] = {"k": top_k}
+    if filters:
+        kwargs["filter"] = filters
+
+    docs: List[Document] = vs.similarity_search(query, **kwargs)
 
     contexts: List[Dict[str, Any]] = []
     for d in docs:
@@ -29,16 +36,15 @@ def retrieve_contexts(query: str, top_k: int = 5) -> List[Dict[str, Any]]:
                 "doc_id": md.get("doc_id"),
                 "chunk_id": md.get("chunk_id"),
                 "source": md.get("source"),
+                "category": md.get("category"),
+                "category_confidence": md.get("category_confidence"),
+                "category_method": md.get("category_method"),
             }
         )
     return contexts
 
 
-def generate_answer(
-    query: str,
-    contexts: List[Dict[str, Any]],
-    style: Optional[Dict[str, Any]] = None,
-) -> str:
+def generate_answer(query: str, contexts: List[Dict[str, Any]], style: Optional[Dict[str, Any]] = None) -> str:
     require_env("ANTHROPIC_API_KEY", ANTHROPIC_API_KEY)
     require_env("ANTHROPIC_MODEL", ANTHROPIC_MODEL)
 

@@ -1,3 +1,6 @@
+
+---
+
 # Cloud AI Toy Project v2–v3
 
 **(LangChain + pgvector RAG Agent)**
@@ -5,9 +8,9 @@
 ## 프로젝트 개요
 
 이 프로젝트는 **Cloud AI 팀 지원용 토이 프로젝트**로,
-AWS 환경으로 확장 가능한 **엔드투엔드 RAG + Agent 데모 서비스**를 구현하는 것이 목표다.
+AWS 환경으로 확장 가능한 **엔드투엔드 RAG(Retrieval-Augmented Generation) + Agent 데모 서비스** 구현을 목표로 한다.
 
-* **v2**: pgvector 기반 RAG 파이프라인
+* **v2**: PostgreSQL(pgvector) 기반 RAG 파이프라인 구현
 * **v3**: v2 위에 *판단·검증·재시도 로직을 갖춘 Agent 레이어* 추가
 
 Docker · PostgreSQL(pgvector) · LangChain · Claude LLM을 사용해
@@ -41,15 +44,15 @@ cloud-ai-toy/
 │       ├── settings.py      # 환경변수 및 상수 관리
 │       ├── vectorstore.py   # Embedding + PGVector 연결
 │       ├── ingest_pg.py     # data/processed → pgvector 인덱싱
-│       ├── rag_chain.py     # Retriever + Claude 응답 생성
-│       └── agent_chain.py   # 판단·검증·재시도 로직을 포함한 RAG Agent
+│       ├── rag_chain.py     # v2: Retriever + Claude 응답 생성
+│       └── agent_chain.py   # v3: 판단·검증·재시도 로직을 포함한 RAG Agent
 │
 ├── data/
-│   ├── raw/                 # 원본 PDF
+│   ├── raw/                 # 원본 PDF (v1 결과 재사용)
 │   └── processed/           # 전처리된 JSON chunk
 │
 ├── db/
-│   └── init.sql             # 초기 테이블 생성 query
+│   └── init.sql             # pgvector 초기 테이블 생성
 │
 ├── docker-compose.yml
 ├── .env.example
@@ -64,7 +67,10 @@ cloud-ai-toy/
 ### 1. PDF 전처리 (v1 결과 재사용)
 
 * PDF → 텍스트 추출 → chunk 분할
+* 문서 단위 메타데이터(`doc_id`, `chunk_id`) 유지
 * 결과를 `data/processed/*.json`으로 저장
+
+> 전처리 로직은 v1에서 검증된 결과를 재사용하여 RAG 품질의 일관성을 유지한다.
 
 ---
 
@@ -72,6 +78,7 @@ cloud-ai-toy/
 
 * `data/processed/*.json` 로드
 * LangChain `Document` 객체로 변환
+* Embedding 생성 후 pgvector에 저장
 * `PGVector.from_documents(..., pre_delete_collection=True)`
 * 컬렉션 이름: `nds_food_safety_docs`
 
@@ -79,40 +86,45 @@ cloud-ai-toy/
 
 ### 3. v2 RAG 질의 처리 (`/query`)
 
+v2는 **단순하고 명확한 RAG 파이프라인**에 집중한다.
+
 1. 사용자 질문 수신
 2. pgvector 기반 k-NN 검색
 3. 검색된 문서를 컨텍스트로 Claude 호출
 4. 답변 + 사용된 컨텍스트 반환
 
-> 단일 검색 + 단일 생성 구조
+> 단일 검색 → 단일 생성 구조
+> Agent 개입 없음
 
 ---
 
 ### 4. v3 Agent 질의 처리 (`/agent_query`)
 
-v3에서는 v2 RAG 위에 **Agent 레이어**를 추가한다.
+v3에서는 v2 RAG 위에 **판단·검증 중심의 Agent 레이어**를 추가한다.
 
-Agent는 다음을 수행한다:
+Agent는 다음 책임을 가진다:
 
 1. **질문 의도 판단**
 
    * 요약 요청 여부 판단
 2. **조건부 검색**
 
-   * 1차 검색 실패 시 질의 재작성 후 재검색
-3. **응답 생성**
+   * 검색 결과 부족 시 질의 재작성 후 재검색
+3. **응답 생성 제어**
 
    * 요약 강도, bullet 개수 제한 적용
 4. **출력 검증**
 
-   * bullet-only 구조 강제
+   * heading + bullet-only 구조 강제
    * 각 bullet에 `(doc_id, chunk_id)` 근거 필수
 5. **재시도 루프**
 
    * 규칙 위반 시 최대 N회 재생성
 6. **안전 종료**
 
-   * 끝까지 실패 시 “문서 근거가 부족하다” 반환
+   * 끝까지 실패 시 “문서 근거가 부족하다”는 응답 반환
+
+Agent의 판단 과정은 `decision` 필드로 노출되어 **동작 투명성**을 확보한다.
 
 ---
 
@@ -201,7 +213,8 @@ Agent 응답에는 다음 정보가 포함된다:
 
   * 요약 여부
   * 검색 라운드 수
-* `answer`: 검증된 최종 답변
+  * 재작성 여부
+* `answer`: 검증을 통과한 최종 답변
 * `contexts`: 실제 사용된 문서 chunk
 
 ---
@@ -216,24 +229,26 @@ Agent 응답에는 다음 정보가 포함된다:
 ### Agent 판단 로직
 
 * 질문 의도에 따른 요약 강도 제어
-* 검색 실패/출력 위반 시 자동 재시도
+* 검색 실패 또는 출력 위반 시 자동 재시도
 
 ### 출력 검증
 
-* 요약 모드에서는 **heading + bullet-only**
+* 요약 모드에서는 **heading + bullet-only** 형식 강제
 * 각 bullet에 `(doc_id, chunk_id)` 필수
 * 검증 실패 시 재생성
 
 ### 완전 재현 가능 환경
 
 * Docker + env 기반 실행
-* 로컬 / CI / 타 환경 동일 동작 보장
+* 로컬 / CI / 타 환경에서 동일 동작 보장
 
 ---
 
 ## 향후 확장 아이디어
 
 * 문서 분류 모델(TF-IDF / BERT) 기반 검색 필터링
+
+  * 현재는 실험 단계이며 **검색에는 미적용**
 * 컨텍스트 재랭킹(Reranker)
 * 세션 단위 메모리(대화형 Agent)
 * AWS 아키텍처(ECS, RDS, Bedrock) 매핑 문서화
@@ -242,9 +257,10 @@ Agent 응답에는 다음 정보가 포함된다:
 
 ## 현재 상태
 
-* v2 RAG 파이프라인 구현 완료
+* v2 pgvector 기반 RAG 파이프라인 구현 완료
 * v3 판단형 RAG Agent 구현 완료
 * 로컬 Docker 환경에서 정상 동작 확인
 * **Agent 수준의 판단·검증·재시도 구조 확보**
+* 문서 분류는 실험 단계이며 서비스 로직에는 적용하지 않음
 
 ---
