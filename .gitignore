@@ -11,3 +11,6 @@ __pycache__/
 
 # OS
 .DS_Store
+
+# python venv
+cloud-ai-toy1/*
